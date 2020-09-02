@@ -91,7 +91,7 @@ every) sum file in the test data having the feature.
 """
 
 from itertools import zip_longest, groupby
-from collections import deque
+from collections import deque, Counter
 import logging
 import warnings
 
@@ -105,14 +105,85 @@ POSSIBILITIES = {
         "stnnbr": ("STNNBR", ),
         "castno": ("CASTNO", ),
         "parameters": ("PARAMETERS", "PARAM", "PARAMETER", "PARAMS", "PARAMATER", "PARAMMETER"),
-        "comments": ("COM", "COMM", "COMME", "COMMEN", "COMMUNTS", "COMMENTS", "COMMENT", "COMMMENTS"),
+        "comments": ("COM", "COMM", "COMME", "COMMEN", "COMMUNTS", "COMMENTS",
+            "COMMENT", "COMMMENTS", "MOORING", "C", "CO", "COMMENTS\t"),
         "max_pressure": ("PRESS", "PRESSURE"),
-        "wire": ("WIRE", "OUT"),
+        "wire": ("WIRE", "OUT", "WHEEL"),
         "bottles": ("BOTTLES", "BOTTLE"),
-        "height": ("BOTTOM", ),
+        "height": ("BOTTOM", "ALT"),
         "lat": ("LATITUDE", ),
         "lon": ("LONGITUDE", ),
         "type": ("TYPE", ),
+        "date": ("DATE", ),
+        "time": ("TIME", ),
+        "event": ("CODE",),
+        "nav": ("NAV",),
+        "depth": ("DEPTH",),
+        "corrected_depth": ("CDEPTH",),
+        }
+INVERTED_POSSIBILITIES = {}
+for key, values in POSSIBILITIES.items():
+    for value in values:
+        INVERTED_POSSIBILITIES[value] = key
+
+def simple_get(d):
+    try:
+        return d.popleft()
+    except IndexError:
+        return None
+
+def params_get(d):
+    try:
+        params = d[0] #popleft but don't remove just yet
+    except IndexError:
+        return None
+    allowed = set("1234567890,- ")
+    if set(params) <= allowed:
+        return d.popleft()
+    else:
+        return None
+
+def comments_get(d):
+    return " ".join(d)
+
+def latlon_get(d):
+    hem = {
+            "N": 1,
+            "S": -1,
+            "E": 1,
+            "W": -1,
+            }
+    try:
+        # we need to ensure we always pop these in case they are empty
+        degree = d.popleft().strip()
+        minute = d.popleft().strip()
+        hemisphere = d.popleft().strip().upper()
+        degree = float(degree)
+        minute = float(minute)
+    except ValueError as e:
+        return None
+    return (degree + minute/60) * hem[hemisphere]
+
+GETTERS = {
+        "expocode": simple_get,
+        "woce_sect": simple_get,
+        "stnnbr": simple_get,
+        "castno": simple_get,
+        "type": simple_get,
+        "date": simple_get,
+        "time": simple_get,
+        "event": simple_get,
+        "lat": latlon_get,
+        "lon": latlon_get,
+        "nav": simple_get,
+        "depth": simple_get,
+        "corrected_depth": simple_get,
+        "height": simple_get,
+        "wire": simple_get,
+        "bottles": simple_get,
+        "max_pressure": simple_get,
+        "parameters": params_get,
+        "comments": comments_get,
         }
 
 class InvalidSumError(Exception):
@@ -129,10 +200,12 @@ def calculate_slices(space_columns):
 
     return column_slices
 
-def read_sum(data):
+def read_sum(data, empty_cols=None):
     """
     data is expected to be some bytes string from a sumfile
     """
+    if empty_cols is None:
+        empty_cols = []
 
     # first up, decode the incoming data as ASCII
     try:
@@ -160,7 +233,7 @@ def read_sum(data):
     header = lines[header_index]
     body = lines[body_index:]
 
-    #TODO get order of "headers"
+    # There might be both uncorrected and corrected depths in the same file
     try:
         uncorreced_depth = preheader.index("UNC")
     except ValueError:
@@ -168,11 +241,39 @@ def read_sum(data):
     try:
         corrected_depth = preheader.index("COR")
     except ValueError:
-        corrected_depth = None
+        try:
+            corrected_depth = preheader.index("XXX")
+        except ValueError:
+            corrected_depth = None
 
     header_slices = calculate_slices([l == " " for l in header])
     headers = [header[slice] for slice in header_slices]
-    log.debug(headers)
+
+    normalized_empty = set(INVERTED_POSSIBILITIES[col] for col in empty_cols)
+
+    # In this case, we have should two "depth" columns and need to figure out
+    # which one is the corrected and uncorrected
+    if len(headers) != len(set(headers)):
+        cnt = Counter(headers)
+        # this checks to make sure it is actually the depth column we have a
+        # duplicate of
+        for header, count in cnt.items():
+            if header == "DEPTH" and count != 2:
+                raise ValueError()
+            elif header != "DEPTH" and count != 1:
+                raise ValueError()
+
+        # corrected depth is the "second" header
+        if corrected_depth > uncorreced_depth:
+            idx = headers[::-1].index("DEPTH")
+            headers[len(headers) - idx - 1] = "CDEPTH"
+        elif corrected_depth > uncorreced_depth:
+            # this situation doesn't seem to occur in _any_ of our sumfiles but
+            # lets code for it anyway
+            idx = headers.index("DEPTH")
+            headers[idx] = "CDEPTH"
+
+    normalized_headers = [INVERTED_POSSIBILITIES[header] for header in headers]
 
 
     # Figure out where the continious colums of "space" are:
@@ -187,10 +288,19 @@ def read_sum(data):
 
     #chop up the body into columns
     tokenized_body = [[line[slice] for slice in column_slices] for line in body]
+    for line in tokenized_body:
+        row_data = {}
+        row = deque(line)
+        for header in normalized_headers:
+            if header in normalized_empty:
+                row_data[header] = None
+                continue
+            getter = GETTERS[header]
+            row_data[header] = getter(row)
+        yield row_data
 
 if __name__ == "__main__":
     import os
-    
     for root, dirs, files in os.walk("test_data"):
         for file in files:
             if not file.endswith(("su.txt", ".sum")):
@@ -198,4 +308,9 @@ if __name__ == "__main__":
             path = os.path.join(root, file)
             #print(path)
             with open(path, 'rb') as f:
-                read_sum(f.read())
+                try:
+                    print(path)
+                    read_sum(f.read())
+                except Exception as e:
+                    print(path, e)
+                    exit(1)
